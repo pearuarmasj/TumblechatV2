@@ -1,0 +1,12 @@
+# Build outputs
+bin/
+intermediate/
+
+# VS temp files
+*.user
+.vs/
+
+# Crypto++ build outputs  
+cryptopp/x64/
+cryptopp/*.obj
+cryptopp/*.pdb
