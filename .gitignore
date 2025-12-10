@@ -10,3 +10,5 @@ intermediate/
 cryptopp/x64/
 cryptopp/*.obj
 cryptopp/*.pdb
+
+.github

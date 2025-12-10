@@ -43,6 +43,14 @@ constexpr int      TIMESTAMP_WINDOW_SEC = 300;        // 5 minute drift allowed
 constexpr int      KEEPALIVE_IDLE_MS    = 30000;
 constexpr int      KEEPALIVE_INTERVAL   = 5000;
 
+// Rekeying
+constexpr uint64_t REKEY_AFTER_MESSAGES = (1ULL << 20);  // Rekey after ~1M messages
+constexpr uint64_t REKEY_WARN_THRESHOLD = REKEY_AFTER_MESSAGES - 1000;  // Warn at this point
+
+// Sliding Window Anti-Replay
+constexpr size_t   REPLAY_WINDOW_SIZE   = 64;         // Accept up to 64 out-of-order packets
+constexpr uint64_t REPLAY_WINDOW_MASK   = UINT64_MAX; // All 64 bits set
+
 // -----------------------------------------------------------------------------
 // Message Types
 // -----------------------------------------------------------------------------
@@ -56,6 +64,7 @@ enum class MsgType : uint8_t {
     SessionError     = 0x05,  // Handshake/session error
     PeerHello        = 0x06,  // Peer ID exchange
     Goodbye          = 0x07,  // Graceful disconnect
+    KeyConfirm       = 0x08,  // Key confirmation (encrypted challenge-response)
     
     // Data messages (0x10-0x1F)
     Data             = 0x11,  // Encrypted application data
@@ -75,10 +84,11 @@ inline const char* MsgTypeName(MsgType t) {
         case MsgType::SessionError:    return "SessionError";
         case MsgType::PeerHello:       return "PeerHello";
         case MsgType::Goodbye:         return "Goodbye";
+        case MsgType::KeyConfirm:      return "KeyConfirm";
         case MsgType::Data:            return "Data";
         case MsgType::RekeyRequest:    return "RekeyRequest";
         case MsgType::RekeyComplete:   return "RekeyComplete";
-        default:                     return "Unknown";
+        default:                       return "Unknown";
     }
 }
 

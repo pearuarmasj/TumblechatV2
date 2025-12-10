@@ -104,6 +104,9 @@ public:
         // Start receive thread
         m_recvThread = std::thread([this] { recvLoop(); });
         
+        // Start rekey timer thread
+        m_rekeyTimerThread = std::thread([this] { rekeyTimerLoop(); });
+        
         return VoidResult::Ok();
     }
     
@@ -128,6 +131,12 @@ public:
             m_recvThread.join();
         }
         
+        // Wait for rekey timer thread
+        if (m_rekeyTimerThread.joinable() && 
+            m_rekeyTimerThread.get_id() != std::this_thread::get_id()) {
+            m_rekeyTimerThread.join();
+        }
+        
         setState(ConnectionState::Disconnected);
         LOG_INFO("Session stopped");
     }
@@ -139,6 +148,9 @@ public:
         if (!isReady()) {
             return VoidResult::Err("Session not ready");
         }
+        
+        // Note: Rekey is handled by background timer thread (rekeyTimerLoop)
+        // The timer triggers every 60 seconds automatically
         
         auto encrypted = m_crypto.encryptMessage(m_sessionKeys, message);
         if (!encrypted) {
@@ -164,6 +176,180 @@ private:
         if (m_onError) {
             m_onError(err, detail);
         }
+    }
+    
+    // -------------------------------------------------------------------------
+    // Automatic Rekeying
+    // -------------------------------------------------------------------------
+    // Rekey Timer Loop - ONLY Initiator triggers rekey, Responder just responds
+    // -------------------------------------------------------------------------
+    void rekeyTimerLoop() {
+        LOG_DEBUG("Rekey timer started (interval: " + std::to_string(REKEY_INTERVAL_SEC) + "s)");
+        
+        while (m_running.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            
+            if (!m_running.load() || !isReady()) continue;
+            
+            // Only Initiator triggers rekey - Responder waits for RekeyRequest
+            if (m_role != HandshakeRole::Initiator) continue;
+            
+            if (m_sessionKeys.shouldRekey() && m_sessionKeys.rekeyState == RekeyState::None) {
+                LOG_INFO("Initiator triggering rekey (60 second interval)");
+                auto rekeyResult = initiateRekey();
+                if (!rekeyResult) {
+                    LOG_ERROR("Auto-rekey failed: " + rekeyResult.error());
+                }
+            }
+        }
+        
+        LOG_DEBUG("Rekey timer stopped");
+    }
+    
+    // -------------------------------------------------------------------------
+    VoidResult initiateRekey() {
+        std::lock_guard<std::mutex> lock(m_rekeyMutex);
+        
+        if (m_sessionKeys.rekeyState != RekeyState::None) {
+            return VoidResult::Ok();  // Already in progress
+        }
+        
+        m_sessionKeys.rekeyState = RekeyState::Requested;
+        LOG_INFO("Generating new key pair for rekey...");
+        
+        // Generate fresh key material
+        auto genResult = m_crypto.generateKeyPair(m_rekeyKeys);
+        if (!genResult) {
+            m_sessionKeys.rekeyState = RekeyState::None;
+            return VoidResult::Err("Failed to generate rekey keys: " + genResult.error());
+        }
+        
+        // Send RekeyRequest with our new public keys
+        std::vector<uint8_t> payload;
+        auto x25519Pub = m_rekeyKeys.serializeX25519Public();
+        auto mlkemPub = m_rekeyKeys.serializeMlkemPublic();
+        payload.reserve(x25519Pub.size() + mlkemPub.size());
+        payload.insert(payload.end(), x25519Pub.begin(), x25519Pub.end());
+        payload.insert(payload.end(), mlkemPub.begin(), mlkemPub.end());
+        
+        auto sendResult = m_frameIo->writeFrame(MsgType::RekeyRequest, payload);
+        if (!sendResult) {
+            m_sessionKeys.rekeyState = RekeyState::None;
+            return VoidResult::Err("Failed to send RekeyRequest: " + sendResult.error());
+        }
+        
+        LOG_DEBUG("Sent RekeyRequest, awaiting peer's new keys...");
+        return VoidResult::Ok();
+    }
+    
+    VoidResult handleRekeyRequest(const std::vector<uint8_t>& payload) {
+        std::lock_guard<std::mutex> lock(m_rekeyMutex);
+        
+        // Only Responder should receive RekeyRequest (Initiator sends it)
+        if (m_role == HandshakeRole::Initiator) {
+            LOG_WARNING("Initiator received RekeyRequest - ignoring (we send, they respond)");
+            return VoidResult::Ok();
+        }
+        
+        // Validate payload size
+        if (payload.size() != X25519_PUBLIC_KEY_SIZE + MLKEM768_PUBLIC_KEY_SIZE) {
+            return VoidResult::Err("Invalid RekeyRequest payload size");
+        }
+        
+        LOG_INFO("Responder received RekeyRequest - generating new keys");
+        
+        // Load peer's (Initiator's) new public keys
+        PeerKeyMaterial peerRekeyKeys;
+        auto loadResult = m_crypto.loadX25519PublicKey(payload.data(), X25519_PUBLIC_KEY_SIZE, peerRekeyKeys);
+        if (!loadResult) return loadResult;
+        
+        loadResult = m_crypto.loadMlkemPublicKey(payload.data() + X25519_PUBLIC_KEY_SIZE, 
+                                                  MLKEM768_PUBLIC_KEY_SIZE, peerRekeyKeys);
+        if (!loadResult) return loadResult;
+        
+        // Generate our new key material
+        auto genResult = m_crypto.generateKeyPair(m_rekeyKeys);
+        if (!genResult) {
+            return VoidResult::Err("Failed to generate rekey keys: " + genResult.error());
+        }
+        
+        m_sessionKeys.rekeyState = RekeyState::InProgress;
+        
+        // Responder sends keys back, waits for ciphertext from Initiator
+        std::vector<uint8_t> response;
+        auto x25519Pub = m_rekeyKeys.serializeX25519Public();
+        auto mlkemPub = m_rekeyKeys.serializeMlkemPublic();
+        response.reserve(x25519Pub.size() + mlkemPub.size());
+        response.insert(response.end(), x25519Pub.begin(), x25519Pub.end());
+        response.insert(response.end(), mlkemPub.begin(), mlkemPub.end());
+        
+        auto sendResult = m_frameIo->writeFrame(MsgType::RekeyComplete, response);
+        if (!sendResult) {
+            m_sessionKeys.rekeyState = RekeyState::None;
+            return VoidResult::Err("Failed to send RekeyComplete: " + sendResult.error());
+        }
+        
+        // Store peer's keys for when we receive ciphertext
+        m_peerRekeyKeys = std::move(peerRekeyKeys);
+        LOG_DEBUG("Responder sent RekeyComplete, waiting for ciphertext from Initiator...");
+        
+        return VoidResult::Ok();
+    }
+    
+    // Initiator receives RekeyComplete from Responder, then sends ciphertext
+    VoidResult handleRekeyComplete(const std::vector<uint8_t>& payload) {
+        std::lock_guard<std::mutex> lock(m_rekeyMutex);
+        
+        // Only Initiator should receive RekeyComplete
+        if (m_role != HandshakeRole::Initiator) {
+            LOG_WARNING("Responder received RekeyComplete - ignoring");
+            return VoidResult::Ok();
+        }
+        
+        if (m_sessionKeys.rekeyState != RekeyState::Requested) {
+            LOG_WARNING("Received RekeyComplete but not in Requested state - ignoring");
+            return VoidResult::Ok();
+        }
+        
+        // Payload is Responder's new keys
+        if (payload.size() != X25519_PUBLIC_KEY_SIZE + MLKEM768_PUBLIC_KEY_SIZE) {
+            return VoidResult::Err("Invalid RekeyComplete payload size");
+        }
+        
+        LOG_INFO("Initiator received Responder's new keys - encapsulating");
+        
+        PeerKeyMaterial peerRekeyKeys;
+        auto loadResult = m_crypto.loadX25519PublicKey(payload.data(), X25519_PUBLIC_KEY_SIZE, peerRekeyKeys);
+        if (!loadResult) return loadResult;
+        
+        loadResult = m_crypto.loadMlkemPublicKey(payload.data() + X25519_PUBLIC_KEY_SIZE, 
+                                                  MLKEM768_PUBLIC_KEY_SIZE, peerRekeyKeys);
+        if (!loadResult) return loadResult;
+        
+        // Encapsulate to Responder's new keys
+        auto encapResult = m_crypto.encapsulateSessionKey(m_rekeyKeys, peerRekeyKeys);
+        if (!encapResult) {
+            return VoidResult::Err("Rekey encapsulation failed: " + encapResult.error());
+        }
+        
+        // Send ciphertext to Responder
+        auto sendResult = m_frameIo->writeFrame(MsgType::MlkemCiphertext, encapResult.value().mlkemCiphertext);
+        if (!sendResult) {
+            return VoidResult::Err("Failed to send rekey ciphertext: " + sendResult.error());
+        }
+        
+        // Update keys - Initiator is done
+        m_myKeys = std::move(m_rekeyKeys);
+        m_peerKeys = std::move(peerRekeyKeys);
+        m_sessionKeys.key = std::move(encapResult.value().sessionKey);
+        m_sessionKeys.sendCounter.store(0);
+        m_sessionKeys.recvCounterMax = 0;
+        m_sessionKeys.replayWindow = 0;
+        m_sessionKeys.rekeyState = RekeyState::None;
+        m_sessionKeys.resetRekeyTimer();
+        
+        LOG_INFO("Rekey complete (Initiator)");
+        return VoidResult::Ok();
     }
     
     // -------------------------------------------------------------------------
@@ -334,6 +520,46 @@ private:
             }
         }
         
+        // Step 5: Key confirmation (both sides prove they derived same key)
+        LOG_DEBUG("Starting key confirmation exchange...");
+        
+        // Generate our confirmation token
+        auto confirmResult = m_crypto.generateKeyConfirmToken(m_sessionKeys.key, m_role);
+        if (!confirmResult) {
+            return VoidResult::Err("Failed to generate key confirm: " + confirmResult.error());
+        }
+        
+        // Send our confirmation
+        sendResult = m_frameIo->writeFrame(MsgType::KeyConfirm, confirmResult.value());
+        if (!sendResult) {
+            return VoidResult::Err("Failed to send KeyConfirm: " + sendResult.error());
+        }
+        
+        // Receive peer's confirmation
+        recvResult = m_frameIo->readFrame();
+        if (!recvResult) {
+            return VoidResult::Err("Failed to receive KeyConfirm: " + recvResult.error());
+        }
+        
+        std::tie(type, payload) = recvResult.value();
+        if (type != MsgType::KeyConfirm) {
+            return VoidResult::Err("Expected KeyConfirm, got " + std::string(MsgTypeName(type)));
+        }
+        
+        // Verify peer's confirmation (peer role is opposite of ours)
+        HandshakeRole confirmPeerRole = (m_role == HandshakeRole::Initiator) 
+                                        ? HandshakeRole::Responder 
+                                        : HandshakeRole::Initiator;
+        auto verifyResult = m_crypto.verifyKeyConfirmToken(m_sessionKeys.key, confirmPeerRole, payload);
+        if (!verifyResult) {
+            return VoidResult::Err("Key confirmation failed: " + verifyResult.error());
+        }
+        
+        LOG_INFO("Key confirmation successful");
+        
+        // Initialize rekey timer
+        m_sessionKeys.resetRekeyTimer();
+        
         setState(ConnectionState::Ready);
         LOG_INFO("Handshake complete - session ready (Hybrid X25519 + ML-KEM-768)");
         
@@ -362,6 +588,48 @@ private:
             switch (type) {
             case MsgType::Data:
                 handleDataMessage(payload);
+                break;
+                
+            case MsgType::RekeyRequest:
+                {
+                    auto rekeyResult = handleRekeyRequest(payload);
+                    if (!rekeyResult) {
+                        notifyError(SessionError::KeyExchangeFail, rekeyResult.error());
+                    }
+                }
+                break;
+                
+            case MsgType::RekeyComplete:
+                {
+                    auto rekeyResult = handleRekeyComplete(payload);
+                    if (!rekeyResult) {
+                        notifyError(SessionError::KeyExchangeFail, rekeyResult.error());
+                    }
+                }
+                break;
+                
+            case MsgType::MlkemCiphertext:
+                // During rekey, responder receives ciphertext separately
+                if (m_sessionKeys.rekeyState == RekeyState::InProgress && m_role == HandshakeRole::Responder) {
+                    auto decapResult = m_crypto.decapsulateSessionKey(
+                        m_rekeyKeys, m_peerRekeyKeys, payload.data(), payload.size());
+                    if (!decapResult) {
+                        notifyError(SessionError::KeyExchangeFail, decapResult.error());
+                    } else {
+                        std::lock_guard<std::mutex> lock(m_rekeyMutex);
+                        m_myKeys = std::move(m_rekeyKeys);
+                        m_peerKeys = std::move(m_peerRekeyKeys);
+                        m_sessionKeys.key = std::move(decapResult.value());
+                        m_sessionKeys.sendCounter.store(0);
+                        m_sessionKeys.recvCounterMax = 0;
+                        m_sessionKeys.replayWindow = 0;
+                        m_sessionKeys.rekeyState = RekeyState::None;
+                        m_sessionKeys.resetRekeyTimer();
+                        LOG_INFO("Rekey complete (responder decapsulated ciphertext)");
+                    }
+                } else {
+                    LOG_WARNING("Unexpected MlkemCiphertext message");
+                }
                 break;
                 
             case MsgType::Goodbye:
@@ -407,11 +675,17 @@ private:
     Socket                      m_socket;
     std::unique_ptr<FrameIO>    m_frameIo;
     std::thread                 m_recvThread;
+    std::thread                 m_rekeyTimerThread;
     
     CryptoEngine                m_crypto;
     KeyMaterial                 m_myKeys;
     PeerKeyMaterial             m_peerKeys;
     SessionKeys                 m_sessionKeys;
+    
+    // Rekeying state
+    std::mutex                  m_rekeyMutex;
+    KeyMaterial                 m_rekeyKeys;
+    PeerKeyMaterial             m_peerRekeyKeys;
     
     PeerIdentity                m_localIdentity;
     PeerIdentity                m_remoteIdentity;

@@ -123,15 +123,97 @@ struct PeerKeyMaterial {
 };
 
 // -----------------------------------------------------------------------------
+// Rekey State
+// -----------------------------------------------------------------------------
+enum class RekeyState : uint8_t {
+    None      = 0,  // Normal operation
+    Requested = 1,  // We sent RekeyRequest, awaiting peer's new keys
+    Pending   = 2,  // We received RekeyRequest, preparing new keys
+    InProgress= 3   // Key exchange in progress
+};
+
+// -----------------------------------------------------------------------------
 // Session Keys (for message encryption)
 // -----------------------------------------------------------------------------
 struct SessionKeys {
     CryptoPP::SecByteBlock    key;            // AES-256 key (32 bytes)
     std::atomic<uint64_t>     sendCounter{0};
-    uint64_t                  recvCounter = 0;
+    
+    // Sliding window anti-replay
+    uint64_t                  recvCounterMax = 0;  // Highest counter seen
+    uint64_t                  replayWindow   = 0;  // Bitmap for last REPLAY_WINDOW_SIZE counters
+    
+    // Rekeying
+    RekeyState                rekeyState = RekeyState::None;
+    std::chrono::steady_clock::time_point lastRekeyTime;  // Time of last rekey
+    
     bool                      useHmac     = true;
     
     bool isValid() const { return key.size() == SESSION_KEY_SIZE; }
+    
+    // Initialize rekey timer (call after handshake)
+    void resetRekeyTimer() {
+        lastRekeyTime = std::chrono::steady_clock::now();
+    }
+    
+    // Check and update anti-replay window. Returns true if packet is valid.
+    bool checkReplay(uint64_t counter) {
+        if (counter == 0) {
+            return false;  // Counter 0 is never valid
+        }
+        
+        if (counter > recvCounterMax) {
+            // New highest counter - update window
+            uint64_t shift = counter - recvCounterMax;
+            if (shift >= REPLAY_WINDOW_SIZE) {
+                // New counter is way ahead - reset window
+                replayWindow = 1;  // Mark current counter as seen
+            } else {
+                // Shift window and mark new counter
+                replayWindow = (replayWindow << shift) | 1;
+            }
+            recvCounterMax = counter;
+            return true;
+        }
+        
+        // Counter is within or below window
+        uint64_t delta = recvCounterMax - counter;
+        if (delta >= REPLAY_WINDOW_SIZE) {
+            // Too old - outside window
+            return false;
+        }
+        
+        // Check if already seen
+        uint64_t bit = 1ULL << delta;
+        if (replayWindow & bit) {
+            return false;  // Replay detected
+        }
+        
+        // Mark as seen
+        replayWindow |= bit;
+        return true;
+    }
+    
+    // Check if we should initiate rekeying (time-based: every 60 seconds)
+    bool shouldRekey() const {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - lastRekeyTime).count();
+        return elapsed >= REKEY_INTERVAL_SEC;
+    }
+    
+    // Check if we should warn about upcoming rekey (5 seconds before)
+    bool shouldWarnRekey() const {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - lastRekeyTime).count();
+        return elapsed >= (REKEY_INTERVAL_SEC - 5) && elapsed < REKEY_INTERVAL_SEC;
+    }
+    
+    // Get seconds until next rekey
+    int64_t secondsUntilRekey() const {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - lastRekeyTime).count();
+        return REKEY_INTERVAL_SEC - elapsed;
+    }
 };
 
 // -----------------------------------------------------------------------------
@@ -172,7 +254,7 @@ public:
             // Use GenerateKeyPair to get raw keys
             x25519.GenerateKeyPair(m_rng, keys.x25519Private, keys.x25519Public);
             
-            LOG_INFO("Generating ML-KEM-768 key pair (post-quantum)...");
+            LOG_INFO("Generating ML-KEM-768 key pair...");
             
             // ML-KEM-768 via liboqs
             keys.mlkemPublic.resize(OQS_KEM_ml_kem_768_length_public_key);
@@ -519,13 +601,12 @@ public:
             result.timestamp = readU64BE(plain, 8);
             result.message   = plain.substr(16, messageEnd - 16);
             
-            // Verify counter (anti-replay)
-            if (result.counter <= keys.recvCounter) {
+            // Verify counter (sliding window anti-replay)
+            if (!keys.checkReplay(result.counter)) {
                 return Result<DecryptedMessage, std::string>::Err(
                     "Replay detected (counter: " + std::to_string(result.counter) + 
-                    ", expected > " + std::to_string(keys.recvCounter) + ")");
+                    ", window max: " + std::to_string(keys.recvCounterMax) + ")");
             }
-            keys.recvCounter = result.counter;
             
             // Verify timestamp (within window)
             uint64_t now = static_cast<uint64_t>(
@@ -574,6 +655,79 @@ public:
         
         LOG_INFO("Generated new peer ID: " + identity.shortFingerprint());
         return VoidResult::Ok();
+    }
+    
+    // -------------------------------------------------------------------------
+    // Key Confirmation
+    // -------------------------------------------------------------------------
+    // Generates a confirmation token: HMAC-SHA256(key, "KEY_CONFIRM" || role || random_nonce)
+    // Returns: [nonce:32][hmac:32]
+    // -------------------------------------------------------------------------
+    static constexpr size_t KEY_CONFIRM_NONCE_SIZE = 32;
+    static constexpr size_t KEY_CONFIRM_TOKEN_SIZE = KEY_CONFIRM_NONCE_SIZE + HMAC_SIZE;
+    
+    Result<std::vector<uint8_t>, std::string>
+    generateKeyConfirmToken(const CryptoPP::SecByteBlock& sessionKey, HandshakeRole role) {
+        try {
+            std::vector<uint8_t> token(KEY_CONFIRM_TOKEN_SIZE);
+            
+            // Generate random nonce
+            m_rng.GenerateBlock(token.data(), KEY_CONFIRM_NONCE_SIZE);
+            
+            // Build HMAC input: "KEY_CONFIRM" || role || nonce
+            const std::string prefix = "KEY_CONFIRM";
+            std::vector<uint8_t> hmacInput;
+            hmacInput.reserve(prefix.size() + 1 + KEY_CONFIRM_NONCE_SIZE);
+            hmacInput.insert(hmacInput.end(), prefix.begin(), prefix.end());
+            hmacInput.push_back(static_cast<uint8_t>(role));
+            hmacInput.insert(hmacInput.end(), token.begin(), token.begin() + KEY_CONFIRM_NONCE_SIZE);
+            
+            // Compute HMAC
+            CryptoPP::HMAC<CryptoPP::SHA256> hmac(sessionKey, sessionKey.size());
+            hmac.Update(hmacInput.data(), hmacInput.size());
+            hmac.Final(token.data() + KEY_CONFIRM_NONCE_SIZE);
+            
+            return Result<std::vector<uint8_t>, std::string>::Ok(std::move(token));
+        }
+        catch (const CryptoPP::Exception& e) {
+            return Result<std::vector<uint8_t>, std::string>::Err(
+                std::string("Key confirm generation failed: ") + e.what());
+        }
+    }
+    
+    // Verify peer's key confirmation token
+    VoidResult verifyKeyConfirmToken(const CryptoPP::SecByteBlock& sessionKey,
+                                      HandshakeRole peerRole,
+                                      const std::vector<uint8_t>& token) {
+        try {
+            if (token.size() != KEY_CONFIRM_TOKEN_SIZE) {
+                return VoidResult::Err("Invalid key confirm token size");
+            }
+            
+            // Build HMAC input: "KEY_CONFIRM" || peerRole || nonce
+            const std::string prefix = "KEY_CONFIRM";
+            std::vector<uint8_t> hmacInput;
+            hmacInput.reserve(prefix.size() + 1 + KEY_CONFIRM_NONCE_SIZE);
+            hmacInput.insert(hmacInput.end(), prefix.begin(), prefix.end());
+            hmacInput.push_back(static_cast<uint8_t>(peerRole));
+            hmacInput.insert(hmacInput.end(), token.begin(), token.begin() + KEY_CONFIRM_NONCE_SIZE);
+            
+            // Compute expected HMAC
+            CryptoPP::HMAC<CryptoPP::SHA256> hmac(sessionKey, sessionKey.size());
+            hmac.Update(hmacInput.data(), hmacInput.size());
+            CryptoPP::byte expectedMac[HMAC_SIZE];
+            hmac.Final(expectedMac);
+            
+            // Constant-time comparison
+            if (!CryptoPP::VerifyBufsEqual(expectedMac, token.data() + KEY_CONFIRM_NONCE_SIZE, HMAC_SIZE)) {
+                return VoidResult::Err("Key confirmation failed - peer may have different key");
+            }
+            
+            return VoidResult::Ok();
+        }
+        catch (const CryptoPP::Exception& e) {
+            return VoidResult::Err(std::string("Key confirm verification failed: ") + e.what());
+        }
     }
 
 private:
