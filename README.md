@@ -5,8 +5,9 @@ Native Win32 GUI client for peer-to-peer encrypted messaging.
 ## What it does
 
 - Direct P2P connection between two machines
-- End-to-end encryption with ChaCha20-Poly1305 + optional HMAC
-- Post-quantum key exchange (ML-KEM / Kyber via liboqs)
+- Hybrid post-quantum key exchange: X25519 (classical) + ML-KEM-768 (Kyber, PQ-resistant)
+- Symmetric encryption: AES-256-GCM + HMAC-SHA256
+- Session keys derived via HKDF-SHA256 from both shared secrets
 - STUN client for discovering your public IP:port
 - UDP hole punching for NAT traversal
 - Win32 GUI (no framework dependencies)
@@ -15,20 +16,23 @@ Native Win32 GUI client for peer-to-peer encrypted messaging.
 
 The original iteration was split into two console apps:
 
-| HybridHost/Client | TumblechatV2 |
-|-------------------|--------------|
-| Separate host + client binaries | Single unified binary |
-| Console-only | Native Win32 GUI |
-| RSA-3072 key exchange | ML-KEM (Kyber) post-quantum |
-| AES-256-GCM | ChaCha20-Poly1305 |
-| Hardcoded localhost testing | STUN discovery + UDP hole punch |
-| Blocking I/O, single-threaded receive | Async session management |
-| Manual counter tracking | Integrated replay protection |
-| ~300 lines each, all-in-one | Modular headers in src/ |
+| Aspect | HybridHost/Client | TumblechatV2 |
+|--------|-------------------|--------------|
+| Architecture | Separate host + client binaries | Single unified binary |
+| UI | Console-only | Native Win32 GUI |
+| Key Exchange | RSA-3072 (classical only) | X25519 + ML-KEM-768 (hybrid PQ) |
+| Symmetric Cipher | AES-256-GCM | AES-256-GCM |
+| Key Derivation | RSA encrypts AES key directly | HKDF combines X25519 + ML-KEM shared secrets |
+| Networking | Hardcoded localhost testing | STUN discovery + UDP hole punch |
+| Threading | Blocking I/O, single-threaded receive | Async session management |
+| Replay Protection | Manual counter tracking | Integrated counter + timestamp validation |
+| Code Structure | ~300 lines each, all-in-one | Modular headers in src/ |
 
-The old code was a proof-of-concept: generate RSA keypair, exchange pubkeys, wrap AES session key, send encrypted blobs back and forth. Worked, but only on localhost or pre-configured IPs.
+The old code was a proof-of-concept: generate RSA keypair, exchange pubkeys, RSA-encrypt an AES session key, send encrypted blobs back and forth. Worked, but only on localhost or pre-configured IPs, and RSA is increasingly seen as a ticking clock for quantum computing threats.
 
-TumblechatV2 addresses the real-world problem: connecting two peers behind NAT without a relay server. STUN discovers external endpoints, UDP hole punching opens the path, then TCP takes over for reliable message delivery.
+TumblechatV2 addresses both problems:
+1. **Post-quantum security**: The hybrid X25519 + ML-KEM scheme means even if Shor's algorithm breaks X25519, ML-KEM still protects the session (and vice versa).
+2. **Real-world connectivity**: STUN discovers external endpoints, UDP hole punching opens the path through NAT, then TCP handles reliable message delivery.
 
 ## Building
 
@@ -67,7 +71,7 @@ TumblechatV2/
 ├── gui_client_v2.cpp        # WinMain, Application, MainWindow
 ├── src/
 │   ├── core/                # types.h, result.h, logger.h
-│   ├── crypto/              # crypto_engine.h (ChaCha20-Poly1305, Kyber)
+│   ├── crypto/              # crypto_engine.h (X25519, ML-KEM, AES-GCM, HKDF)
 │   ├── network/             # socket_wrapper.h, frame_io.h, udp_hole_punch.h
 │   └── session/             # session.h, connection_manager.h
 ├── cryptopp/                # Crypto++ source + prebuilt lib
