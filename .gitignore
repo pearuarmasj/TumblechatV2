@@ -12,3 +12,4 @@ cryptopp/*.obj
 cryptopp/*.pdb
 
 .github
+.claude

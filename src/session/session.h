@@ -409,7 +409,18 @@ private:
         }
         
         LOG_INFO("Peer fingerprint: " + m_peerKeys.fingerprint().substr(0, 16) + "...");
-        
+
+        // Verify peer fingerprint against known peers (TOFU)
+        std::string peerEndpoint = m_socket.remoteAddress();
+        auto fpCheck = m_crypto.checkAndStorePeerFingerprint(peerEndpoint, m_peerKeys.fingerprint());
+        if (!fpCheck) {
+            return VoidResult::Err("Fingerprint check failed: " + fpCheck.error());
+        }
+        if (fpCheck.value() == CryptoEngine::FingerprintCheckResult::Changed) {
+            return VoidResult::Err("SECURITY: Peer fingerprint changed - possible MITM attack. "
+                                   "If this is expected, delete known_peers.txt and reconnect.");
+        }
+
         // Step 3: Exchange peer IDs
         std::vector<uint8_t> helloPayload;
         helloPayload.reserve(PEER_ID_SIZE + 1);

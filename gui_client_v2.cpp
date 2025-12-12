@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <thread>
 
 #include "src/core/types.h"
 #include "src/core/logger.h"
@@ -68,6 +69,9 @@ constexpr int BUTTON_WIDTH  = 70;
 // Timer
 constexpr UINT_PTR TIMER_REFRESH = 1;
 constexpr UINT REFRESH_INTERVAL  = 100;  // ms
+
+// Custom messages
+constexpr UINT WM_STUN_COMPLETE = WM_USER + 1;
 
 } // namespace ui
 
@@ -332,10 +336,19 @@ private:
             
         case WM_DESTROY:
             KillTimer(m_hwnd, ui::TIMER_REFRESH);
+            // Clean up STUN thread
+            if (m_stunThread.joinable()) {
+                m_stunThread.join();
+            }
             PostQuitMessage(0);
             return 0;
-            
+
         default:
+            // Handle custom messages
+            if (msg == ui::WM_STUN_COMPLETE) {
+                onStunComplete();
+                return 0;
+            }
             return DefWindowProc(m_hwnd, msg, wParam, lParam);
         }
     }
@@ -648,21 +661,50 @@ private:
     }
     
     void onStun() {
+        // Prevent multiple concurrent STUN queries
+        if (m_stunPending.load()) {
+            LOG_WARNING("STUN query already in progress");
+            return;
+        }
+
         // Get local port for STUN discovery
         char lportBuf[32];
         GetWindowTextA(m_hLPort, lportBuf, sizeof(lportBuf));
         uint16_t localPort = static_cast<uint16_t>(atoi(lportBuf));
-        
-        // Use UdpHolePuncher for STUN discovery only
-        UdpHolePuncher puncher;
-        auto result = puncher.discoverOnly(localPort);
-        
-        if (result) {
-            std::string endpoint = result.value().ip + ":" + std::to_string(result.value().port);
-            LOG_INFO("Your public endpoint: " + endpoint);
-            SetWindowTextA(m_hMyEndpoint, endpoint.c_str());
+
+        // Clean up previous thread if any
+        if (m_stunThread.joinable()) {
+            m_stunThread.join();
+        }
+
+        m_stunPending.store(true);
+        LOG_INFO("Starting STUN query...");
+
+        // Run STUN query in background thread
+        HWND hwnd = m_hwnd;
+        m_stunThread = std::thread([this, localPort, hwnd] {
+            UdpHolePuncher puncher;
+            auto result = puncher.discoverOnly(localPort);
+
+            if (result) {
+                m_stunResult = result.value().ip + ":" + std::to_string(result.value().port);
+            } else {
+                m_stunResult = "ERROR:" + result.error();
+            }
+
+            // Notify UI thread
+            PostMessage(hwnd, ui::WM_STUN_COMPLETE, 0, 0);
+        });
+    }
+
+    void onStunComplete() {
+        m_stunPending.store(false);
+
+        if (m_stunResult.rfind("ERROR:", 0) == 0) {
+            LOG_ERROR("STUN query failed: " + m_stunResult.substr(6));
         } else {
-            LOG_ERROR("STUN query failed: " + result.error());
+            LOG_INFO("Your public endpoint: " + m_stunResult);
+            SetWindowTextA(m_hMyEndpoint, m_stunResult.c_str());
         }
     }
     
@@ -840,6 +882,11 @@ private:
     
     size_t m_logIndex = 0;
     std::unique_ptr<UdpHolePuncher> m_holePuncher;
+
+    // Async STUN query
+    std::thread m_stunThread;
+    std::string m_stunResult;
+    std::atomic<bool> m_stunPending{false};
 };
 
 // =============================================================================

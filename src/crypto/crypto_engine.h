@@ -24,6 +24,7 @@
 #include <chrono>
 #include <fstream>
 #include <algorithm>
+#include <map>
 
 // Crypto++ headers
 #include <osrng.h>
@@ -84,8 +85,8 @@ struct KeyMaterial {
     CryptoPP::SecByteBlock x25519Public;
     
     // ML-KEM-768 (post-quantum)
-    std::vector<uint8_t>   mlkemPublic;   // 1184 bytes
-    std::vector<uint8_t>   mlkemSecret;   // 2400 bytes
+    std::vector<uint8_t>      mlkemPublic;   // 1184 bytes
+    CryptoPP::SecByteBlock    mlkemSecret;   // 2400 bytes (secure memory)
     
     std::string fingerprint() const {
         // Fingerprint is hash of both public keys
@@ -258,7 +259,7 @@ public:
             
             // ML-KEM-768 via liboqs
             keys.mlkemPublic.resize(OQS_KEM_ml_kem_768_length_public_key);
-            keys.mlkemSecret.resize(OQS_KEM_ml_kem_768_length_secret_key);
+            keys.mlkemSecret.CleanNew(OQS_KEM_ml_kem_768_length_secret_key);
             
             OQS_STATUS status = OQS_KEM_ml_kem_768_keypair(
                 keys.mlkemPublic.data(),
@@ -369,12 +370,8 @@ public:
                 reinterpret_cast<const CryptoPP::byte*>(salt.data()), salt.size(),
                 reinterpret_cast<const CryptoPP::byte*>(info.data()), info.size());
             
-            // Securely clear intermediate secrets
-            CryptoPP::SecByteBlock zero((std::max)(x25519Shared.size(), mlkemShared.size()));
-            std::memset(zero.data(), 0, zero.size());
-            std::memcpy(x25519Shared.data(), zero.data(), x25519Shared.size());
-            std::memcpy(mlkemShared.data(), zero.data(), mlkemShared.size());
-            
+            // Note: x25519Shared and mlkemShared are SecByteBlocks - automatically zeroed on destruction
+
             LOG_INFO("Derived hybrid session key (X25519 + ML-KEM-768)");
             
             return Result<EncapsulationResult, std::string>::Ok(std::move(result));
@@ -445,12 +442,8 @@ public:
                 reinterpret_cast<const CryptoPP::byte*>(salt.data()), salt.size(),
                 reinterpret_cast<const CryptoPP::byte*>(info.data()), info.size());
             
-            // Securely clear intermediate secrets
-            CryptoPP::SecByteBlock zero((std::max)(x25519Shared.size(), mlkemShared.size()));
-            std::memset(zero.data(), 0, zero.size());
-            std::memcpy(x25519Shared.data(), zero.data(), x25519Shared.size());
-            std::memcpy(mlkemShared.data(), zero.data(), mlkemShared.size());
-            
+            // Note: x25519Shared and mlkemShared are SecByteBlocks - automatically zeroed on destruction
+
             LOG_INFO("Decapsulated hybrid session key (X25519 + ML-KEM-768)");
             
             return Result<CryptoPP::SecByteBlock, std::string>::Ok(std::move(sessionKey));
@@ -615,10 +608,10 @@ public:
             
             int64_t drift = static_cast<int64_t>(now) - static_cast<int64_t>(result.timestamp);
             if (std::abs(drift) > TIMESTAMP_WINDOW_SEC * 1000) {
-                LOG_WARNING("Large timestamp drift: " + std::to_string(drift / 1000) + "s");
-                // Not a hard error, just warn
+                return Result<DecryptedMessage, std::string>::Err(
+                    "Timestamp outside acceptable window (" + std::to_string(drift / 1000) + "s drift)");
             }
-            
+
             return Result<DecryptedMessage, std::string>::Ok(std::move(result));
         }
         catch (const CryptoPP::Exception& e) {
@@ -656,7 +649,96 @@ public:
         LOG_INFO("Generated new peer ID: " + identity.shortFingerprint());
         return VoidResult::Ok();
     }
-    
+
+    // -------------------------------------------------------------------------
+    // Known Peer Fingerprint Management (TOFU)
+    // -------------------------------------------------------------------------
+    // Stores fingerprints keyed by endpoint (ip:port) in a simple text file.
+    // Returns: Ok if new peer or fingerprint matches, Err if fingerprint changed (MITM warning)
+    // -------------------------------------------------------------------------
+    enum class FingerprintCheckResult {
+        NewPeer,          // First time seeing this endpoint
+        Matched,          // Fingerprint matches stored value
+        Changed           // DANGER: Fingerprint changed from stored value
+    };
+
+    Result<FingerprintCheckResult, std::string>
+    checkAndStorePeerFingerprint(const std::string& endpoint, const std::string& fingerprint,
+                                  const std::string& filename = "known_peers.txt") {
+        // Load existing known peers
+        std::map<std::string, std::string> knownPeers;
+        std::ifstream in(filename);
+        if (in) {
+            std::string line;
+            while (std::getline(in, line)) {
+                auto sep = line.find('|');
+                if (sep != std::string::npos) {
+                    knownPeers[line.substr(0, sep)] = line.substr(sep + 1);
+                }
+            }
+        }
+
+        // Check if we know this endpoint
+        auto it = knownPeers.find(endpoint);
+        if (it != knownPeers.end()) {
+            if (it->second == fingerprint) {
+                LOG_INFO("Peer fingerprint verified for " + endpoint);
+                return Result<FingerprintCheckResult, std::string>::Ok(FingerprintCheckResult::Matched);
+            } else {
+                LOG_ERROR("FINGERPRINT CHANGED for " + endpoint + "!");
+                LOG_ERROR("  Expected: " + it->second.substr(0, 16) + "...");
+                LOG_ERROR("  Got:      " + fingerprint.substr(0, 16) + "...");
+                LOG_ERROR("  This could indicate a MITM attack!");
+                return Result<FingerprintCheckResult, std::string>::Ok(FingerprintCheckResult::Changed);
+            }
+        }
+
+        // New peer - store fingerprint
+        knownPeers[endpoint] = fingerprint;
+
+        std::ofstream out(filename, std::ios::trunc);
+        if (!out) {
+            return Result<FingerprintCheckResult, std::string>::Err("Failed to save known peers");
+        }
+
+        for (const auto& [ep, fp] : knownPeers) {
+            out << ep << "|" << fp << "\n";
+        }
+
+        LOG_INFO("New peer " + endpoint + " - fingerprint stored (TOFU)");
+        return Result<FingerprintCheckResult, std::string>::Ok(FingerprintCheckResult::NewPeer);
+    }
+
+    // Clear a stored fingerprint (use if user confirms fingerprint change is expected)
+    VoidResult clearPeerFingerprint(const std::string& endpoint,
+                                     const std::string& filename = "known_peers.txt") {
+        std::map<std::string, std::string> knownPeers;
+        std::ifstream in(filename);
+        if (in) {
+            std::string line;
+            while (std::getline(in, line)) {
+                auto sep = line.find('|');
+                if (sep != std::string::npos) {
+                    knownPeers[line.substr(0, sep)] = line.substr(sep + 1);
+                }
+            }
+        }
+
+        knownPeers.erase(endpoint);
+
+        std::ofstream out(filename, std::ios::trunc);
+        if (!out) {
+            return VoidResult::Err("Failed to save known peers");
+        }
+
+        for (const auto& [ep, fp] : knownPeers) {
+            out << ep << "|" << fp << "\n";
+        }
+
+        LOG_INFO("Cleared stored fingerprint for " + endpoint);
+        return VoidResult::Ok();
+    }
+
     // -------------------------------------------------------------------------
     // Key Confirmation
     // -------------------------------------------------------------------------

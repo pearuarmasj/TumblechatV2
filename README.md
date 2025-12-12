@@ -41,11 +41,13 @@ TumblechatV2 addresses both problems:
 - Windows 10 SDK
 - C++17
 
-```
-MSBuild TumblechatV2.vcxproj /p:Configuration=Release /p:Platform=x64
+```powershell
+# Find and run MSBuild (works regardless of VS install location)
+$msbuild = Get-ChildItem -Path 'C:\Program Files*\Microsoft Visual Studio' -Recurse -Filter 'MSBuild.exe' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'amd64' } | Select-Object -First 1 -ExpandProperty FullName
+& $msbuild TumblechatV2.vcxproj /p:Configuration=Release /p:Platform=x64
 ```
 
-Or open `TumblechatV2.slnx` and hit build.
+Or open `TumblechatV2.slnx` in Visual Studio and build (F7).
 
 Output: `bin\Release\TumblechatV2.exe`
 
