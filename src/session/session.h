@@ -14,8 +14,7 @@
 #include "../core/types.h"
 #include "../core/result.h"
 #include "../core/logger.h"
-#include "../network/socket_wrapper.h"
-#include "../network/frame_io.h"
+#include "../network/transport.h"
 #include "../crypto/crypto_engine.h"
 
 namespace p2p {
@@ -25,6 +24,7 @@ public:
     using MessageHandler = std::function<void(const std::string& msg, uint64_t timestamp)>;
     using StateHandler   = std::function<void(ConnectionState state)>;
     using ErrorHandler   = std::function<void(SessionError err, const std::string& detail)>;
+    using RekeyHandler   = std::function<void(const std::string& newFingerprint)>;
     
     Session() = default;
     ~Session() { stop(); }
@@ -39,6 +39,7 @@ public:
     void onMessage(MessageHandler handler) { m_onMessage = std::move(handler); }
     void onStateChange(StateHandler handler) { m_onState = std::move(handler); }
     void onError(ErrorHandler handler) { m_onError = std::move(handler); }
+    void onRekey(RekeyHandler handler) { m_onRekey = std::move(handler); }
     
     // -------------------------------------------------------------------------
     // State Access
@@ -72,26 +73,22 @@ public:
     }
     
     // -------------------------------------------------------------------------
-    // Start Session with Existing Socket
+    // Start Session with Existing Transport
     // -------------------------------------------------------------------------
-    VoidResult start(Socket socket, HandshakeRole role) {
+    VoidResult start(std::unique_ptr<ITransport> transport, HandshakeRole role) {
         if (m_running.load()) {
             return VoidResult::Err("Session already running");
         }
-        
-        m_socket = std::move(socket);
+
+        m_transport = std::move(transport);
         m_role = role;
         m_running.store(true);
-        
+
         setState(ConnectionState::Handshaking);
-        
-        // Configure socket
-        m_socket.setNoDelay();
-        m_socket.setKeepalive(KEEPALIVE_IDLE_MS, KEEPALIVE_INTERVAL);
-        
-        LOG_INFO(std::string("Session starting as ") + 
+
+        LOG_INFO(std::string("Session starting as ") +
                  (role == HandshakeRole::Initiator ? "initiator" : "responder") +
-                 " - " + m_socket.connectionTuple());
+                 " - " + m_transport->remoteEndpoint());
         
         // Perform handshake synchronously before starting recv thread
         auto handshakeResult = performHandshake();
@@ -115,15 +112,14 @@ public:
     // -------------------------------------------------------------------------
     void stop() {
         if (!m_running.exchange(false)) return;
-        
+
         setState(ConnectionState::Disconnecting);
-        
+
         // Try graceful goodbye
-        if (m_frameIo) {
-            m_frameIo->writeFrame(MsgType::Goodbye);
+        if (m_transport) {
+            m_transport->send(MsgType::Goodbye, {});
+            m_transport->close();
         }
-        
-        m_socket.close();
         
         // Wait for recv thread (avoid self-join)
         if (m_recvThread.joinable() && 
@@ -156,8 +152,8 @@ public:
         if (!encrypted) {
             return VoidResult::Err(encrypted.error());
         }
-        
-        return m_frameIo->writeFrame(MsgType::Data, encrypted.value());
+
+        return m_transport->send(MsgType::Data, encrypted.value());
     }
 
 private:
@@ -232,7 +228,7 @@ private:
         payload.insert(payload.end(), x25519Pub.begin(), x25519Pub.end());
         payload.insert(payload.end(), mlkemPub.begin(), mlkemPub.end());
         
-        auto sendResult = m_frameIo->writeFrame(MsgType::RekeyRequest, payload);
+        auto sendResult = m_transport->send(MsgType::RekeyRequest, payload);
         if (!sendResult) {
             m_sessionKeys.rekeyState = RekeyState::None;
             return VoidResult::Err("Failed to send RekeyRequest: " + sendResult.error());
@@ -283,7 +279,7 @@ private:
         response.insert(response.end(), x25519Pub.begin(), x25519Pub.end());
         response.insert(response.end(), mlkemPub.begin(), mlkemPub.end());
         
-        auto sendResult = m_frameIo->writeFrame(MsgType::RekeyComplete, response);
+        auto sendResult = m_transport->send(MsgType::RekeyComplete, response);
         if (!sendResult) {
             m_sessionKeys.rekeyState = RekeyState::None;
             return VoidResult::Err("Failed to send RekeyComplete: " + sendResult.error());
@@ -333,7 +329,7 @@ private:
         }
         
         // Send ciphertext to Responder
-        auto sendResult = m_frameIo->writeFrame(MsgType::MlkemCiphertext, encapResult.value().mlkemCiphertext);
+        auto sendResult = m_transport->send(MsgType::MlkemCiphertext, encapResult.value().mlkemCiphertext);
         if (!sendResult) {
             return VoidResult::Err("Failed to send rekey ciphertext: " + sendResult.error());
         }
@@ -349,27 +345,31 @@ private:
         m_sessionKeys.resetRekeyTimer();
         
         LOG_INFO("Rekey complete (Initiator)");
+
+        // Notify UI of new fingerprint
+        if (m_onRekey) {
+            m_onRekey(m_peerKeys.fingerprint());
+        }
+
         return VoidResult::Ok();
     }
-    
+
     // -------------------------------------------------------------------------
     // Unified Handshake (X25519 + ML-KEM-768 Hybrid)
     // -------------------------------------------------------------------------
     VoidResult performHandshake() {
-        m_frameIo = std::make_unique<FrameIO>(m_socket.handle());
-        
         LOG_INFO("Starting handshake (X25519 + ML-KEM-768 hybrid)...");
         
         // Step 1: Exchange X25519 public keys
         auto x25519PubSer = m_myKeys.serializeX25519Public();
         LOG_DEBUG("Sending X25519 public key (" + std::to_string(x25519PubSer.size()) + " bytes)");
         
-        auto sendResult = m_frameIo->writeFrame(MsgType::X25519PublicKey, x25519PubSer);
+        auto sendResult = m_transport->send(MsgType::X25519PublicKey, x25519PubSer);
         if (!sendResult) {
             return VoidResult::Err("Failed to send X25519 key: " + sendResult.error());
         }
-        
-        auto recvResult = m_frameIo->readFrame();
+
+        auto recvResult = m_transport->receive();
         if (!recvResult) {
             return VoidResult::Err("Failed to receive X25519 key: " + recvResult.error());
         }
@@ -388,12 +388,12 @@ private:
         auto mlkemPubSer = m_myKeys.serializeMlkemPublic();
         LOG_DEBUG("Sending ML-KEM-768 public key (" + std::to_string(mlkemPubSer.size()) + " bytes)");
         
-        sendResult = m_frameIo->writeFrame(MsgType::MlkemPublicKey, mlkemPubSer);
+        sendResult = m_transport->send(MsgType::MlkemPublicKey, mlkemPubSer);
         if (!sendResult) {
             return VoidResult::Err("Failed to send ML-KEM key: " + sendResult.error());
         }
-        
-        recvResult = m_frameIo->readFrame();
+
+        recvResult = m_transport->receive();
         if (!recvResult) {
             return VoidResult::Err("Failed to receive ML-KEM key: " + recvResult.error());
         }
@@ -411,7 +411,7 @@ private:
         LOG_INFO("Peer fingerprint: " + m_peerKeys.fingerprint().substr(0, 16) + "...");
 
         // Verify peer fingerprint against known peers (TOFU)
-        std::string peerEndpoint = m_socket.remoteAddress();
+        std::string peerEndpoint = m_transport->remoteEndpoint();
         auto fpCheck = m_crypto.checkAndStorePeerFingerprint(peerEndpoint, m_peerKeys.fingerprint());
         if (!fpCheck) {
             return VoidResult::Err("Fingerprint check failed: " + fpCheck.error());
@@ -427,12 +427,12 @@ private:
         helloPayload.insert(helloPayload.end(), m_localIdentity.id.begin(), m_localIdentity.id.end());
         helloPayload.push_back(static_cast<uint8_t>(m_role));
         
-        sendResult = m_frameIo->writeFrame(MsgType::PeerHello, helloPayload);
+        sendResult = m_transport->send(MsgType::PeerHello, helloPayload);
         if (!sendResult) {
             return VoidResult::Err("Failed to send PeerHello: " + sendResult.error());
         }
-        
-        recvResult = m_frameIo->readFrame();
+
+        recvResult = m_transport->receive();
         if (!recvResult) {
             return VoidResult::Err("Failed to receive PeerHello: " + recvResult.error());
         }
@@ -485,15 +485,15 @@ private:
             m_sessionKeys.key = std::move(encapData.sessionKey);
             
             // Send ML-KEM ciphertext
-            sendResult = m_frameIo->writeFrame(MsgType::MlkemCiphertext, encapData.mlkemCiphertext);
+            sendResult = m_transport->send(MsgType::MlkemCiphertext, encapData.mlkemCiphertext);
             if (!sendResult) {
                 return VoidResult::Err("Failed to send MlkemCiphertext: " + sendResult.error());
             }
-            
+
             LOG_DEBUG("Sent ML-KEM ciphertext, waiting for SessionOk...");
-            
+
             // Wait for SessionOk
-            recvResult = m_frameIo->readFrame();
+            recvResult = m_transport->receive();
             if (!recvResult) {
                 return VoidResult::Err("Failed to receive SessionOk: " + recvResult.error());
             }
@@ -505,7 +505,7 @@ private:
         }
         else {
             // Responder: receive ciphertext and decapsulate
-            recvResult = m_frameIo->readFrame();
+            recvResult = m_transport->receive();
             if (!recvResult) {
                 return VoidResult::Err("Failed to receive MlkemCiphertext: " + recvResult.error());
             }
@@ -523,9 +523,9 @@ private:
             }
             
             m_sessionKeys.key = std::move(decapResult.value());
-            
+
             // Send SessionOk
-            sendResult = m_frameIo->writeFrame(MsgType::SessionOk);
+            sendResult = m_transport->send(MsgType::SessionOk, {});
             if (!sendResult) {
                 return VoidResult::Err("Failed to send SessionOk: " + sendResult.error());
             }
@@ -541,13 +541,13 @@ private:
         }
         
         // Send our confirmation
-        sendResult = m_frameIo->writeFrame(MsgType::KeyConfirm, confirmResult.value());
+        sendResult = m_transport->send(MsgType::KeyConfirm, confirmResult.value());
         if (!sendResult) {
             return VoidResult::Err("Failed to send KeyConfirm: " + sendResult.error());
         }
-        
+
         // Receive peer's confirmation
-        recvResult = m_frameIo->readFrame();
+        recvResult = m_transport->receive();
         if (!recvResult) {
             return VoidResult::Err("Failed to receive KeyConfirm: " + recvResult.error());
         }
@@ -582,9 +582,9 @@ private:
     // -------------------------------------------------------------------------
     void recvLoop() {
         LOG_DEBUG("Receive loop started");
-        
+
         while (m_running.load()) {
-            auto result = m_frameIo->readFrame();
+            auto result = m_transport->receive();
             
             if (!result) {
                 if (m_running.load()) {
@@ -637,6 +637,11 @@ private:
                         m_sessionKeys.rekeyState = RekeyState::None;
                         m_sessionKeys.resetRekeyTimer();
                         LOG_INFO("Rekey complete (responder decapsulated ciphertext)");
+
+                        // Notify UI of new fingerprint
+                        if (m_onRekey) {
+                            m_onRekey(m_peerKeys.fingerprint());
+                        }
                     }
                 } else {
                     LOG_WARNING("Unexpected MlkemCiphertext message");
@@ -682,9 +687,8 @@ private:
     std::atomic<bool>           m_running{false};
     std::atomic<ConnectionState> m_state{ConnectionState::Disconnected};
     HandshakeRole               m_role = HandshakeRole::Initiator;
-    
-    Socket                      m_socket;
-    std::unique_ptr<FrameIO>    m_frameIo;
+
+    std::unique_ptr<ITransport> m_transport;
     std::thread                 m_recvThread;
     std::thread                 m_rekeyTimerThread;
     
@@ -704,6 +708,7 @@ private:
     MessageHandler              m_onMessage;
     StateHandler                m_onState;
     ErrorHandler                m_onError;
+    RekeyHandler                m_onRekey;
 };
 
 } // namespace p2p

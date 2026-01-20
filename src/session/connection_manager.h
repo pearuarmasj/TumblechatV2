@@ -17,6 +17,7 @@
 #include "../core/result.h"
 #include "../core/logger.h"
 #include "../network/socket_wrapper.h"
+#include "../network/tcp_transport.h"
 #include "session.h"
 
 #pragma comment(lib, "iphlpapi.lib")
@@ -623,21 +624,29 @@ private:
     // -------------------------------------------------------------------------
     void createSession(Socket socket, HandshakeRole role) {
         auto session = std::make_shared<Session>();
-        
+
         auto initResult = session->initialize(m_config.useHmac);
         if (!initResult) {
             notifyError("Session init: " + initResult.error());
             m_sessionChosen.store(false);
             return;
         }
-        
-        auto startResult = session->start(std::move(socket), role);
+
+        // Wrap socket in TcpTransport
+        auto transportResult = TcpTransport::fromSocket(std::move(socket));
+        if (!transportResult) {
+            notifyError("Transport create: " + transportResult.error());
+            m_sessionChosen.store(false);
+            return;
+        }
+
+        auto startResult = session->start(std::move(transportResult.value()), role);
         if (!startResult) {
             notifyError("Session start: " + startResult.error());
             m_sessionChosen.store(false);
             return;
         }
-        
+
         if (m_onSessionReady) {
             m_onSessionReady(session);
         }

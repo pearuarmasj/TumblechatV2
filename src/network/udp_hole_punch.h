@@ -33,6 +33,7 @@
 #include "../core/types.h"
 #include "../core/result.h"
 #include "../core/logger.h"
+#include "../session/connection_manager.h"
 #include "socket_wrapper.h"
 
 #pragma comment(lib, "ws2_32.lib")

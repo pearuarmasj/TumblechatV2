@@ -14,7 +14,7 @@ namespace p2p {
 // Protocol Constants
 // -----------------------------------------------------------------------------
 constexpr uint8_t  PROTOCOL_VERSION     = 2;          // v2: X25519 + ML-KEM-768
-constexpr size_t   MAX_FRAME_SIZE       = 64 * 1024;  // 64KB max message
+constexpr size_t   MAX_FRAME_SIZE       = 4000 * 1024;  // 4MB max message (or 4.096MB in binary)
 constexpr size_t   PEER_ID_SIZE         = 32;
 constexpr size_t   SESSION_KEY_SIZE     = 32;         // AES-256
 
