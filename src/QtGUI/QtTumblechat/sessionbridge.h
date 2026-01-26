@@ -62,6 +62,9 @@ signals:
     // Emitted when message received from peer
     void messageReceived(const QString &text, quint64 timestamp);
 
+    // Emitted when binary message received from peer (binary-safe)
+    void binaryMessageReceived(const QByteArray &data, quint64 timestamp);
+
     // Emitted on error
     void errorOccurred(int error, const QString &detail); // SessionError as int
 
@@ -74,6 +77,9 @@ signals:
 public slots:
     // Send message to peer (thread-safe, can call from any thread)
     bool sendMessage(const QString &text);
+
+    // Send binary data to peer (binary-safe, for images/files)
+    bool sendBinaryMessage(const QByteArray &data);
 
     // Graceful disconnect
     void disconnect();

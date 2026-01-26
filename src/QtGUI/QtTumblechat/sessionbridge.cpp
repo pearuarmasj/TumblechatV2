@@ -34,10 +34,10 @@ void SessionBridge::setupCallbacks()
 {
     // Message callback - fires on recv worker thread
     m_session->onMessage([this](const std::string& msg, uint64_t timestamp) {
-        QString text = QString::fromStdString(msg);
-        // Marshal to Qt main thread
-        QTimer::singleShot(0, this, [this, text, timestamp]() {
-            emit messageReceived(text, timestamp);
+        // Convert std::string to QByteArray (binary-safe)
+        QByteArray data(msg.data(), static_cast<int>(msg.size()));
+        QTimer::singleShot(0, this, [this, data, timestamp]() {
+            emit binaryMessageReceived(data, timestamp);
         });
     });
 
@@ -331,6 +331,28 @@ bool SessionBridge::sendMessage(const QString &text)
     }
 
     auto result = m_session->send(text.toStdString());
+    return result.isOk();
+}
+
+bool SessionBridge::sendBinaryMessage(const QByteArray &data)
+{
+    if (!m_session) {
+        emit errorOccurred(0, QString("[sendBinary] No session (size=%1)").arg(data.size()));
+        return false;
+    }
+    if (!m_session->isReady()) {
+        emit errorOccurred(0, QString("[sendBinary] Not ready (size=%1)").arg(data.size()));
+        return false;
+    }
+
+    // Convert QByteArray to std::string (binary-safe)
+    std::string msg(data.constData(), data.size());
+    auto result = m_session->send(msg);
+    if (!result.isOk()) {
+        emit errorOccurred(0, QString("[sendBinary] send failed (size=%1): %2")
+                           .arg(data.size())
+                           .arg(QString::fromStdString(result.error())));
+    }
     return result.isOk();
 }
 

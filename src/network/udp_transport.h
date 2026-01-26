@@ -54,6 +54,11 @@ constexpr size_t   UDP_MAX_PACKET_SIZE      = 1400;   // MTU-safe (leaves room f
 constexpr size_t   UDP_HEADER_SIZE          = 12;     // Our protocol header size
 constexpr size_t   UDP_MAX_PAYLOAD_SIZE     = UDP_MAX_PACKET_SIZE - UDP_HEADER_SIZE;
 
+// Fragment header overhead: 1 (flags|0x80) + 1 (MsgType) + 2 (groupId) + 2 (fragIndex) + 2 (totalFrags) = 8 bytes
+constexpr size_t   UDP_FRAGMENT_HEADER_SIZE = 8;
+constexpr size_t   UDP_FRAGMENT_MAX_CHUNK   = UDP_MAX_PAYLOAD_SIZE - UDP_FRAGMENT_HEADER_SIZE;
+constexpr int      UDP_FRAGMENT_TIMEOUT_MS  = 30000;  // 30 second timeout for incomplete fragment groups
+
 // Timing constants (milliseconds)
 constexpr int      UDP_INITIAL_RTO_MS       = 1000;   // Initial retransmit timeout
 constexpr int      UDP_MIN_RTO_MS           = 200;    // Minimum RTO
@@ -437,6 +442,9 @@ private:
     // Send data packet with reliability (adds to retransmit queue)
     VoidResult sendDataPacket(MsgType msgType, const std::vector<uint8_t>& payload);
 
+    // Send a raw data packet (pre-formatted payload, no MsgType prepend) with reliability
+    VoidResult sendRawDataPacket(const std::vector<uint8_t>& rawPayload);
+
     // Send ACK packet
     VoidResult sendAck();
 
@@ -502,6 +510,16 @@ private:
     bool deliverFromReorderBuffer();
 
     // -------------------------------------------------------------------------
+    // Fragment Reassembly
+    // -------------------------------------------------------------------------
+
+    // Handle a fragmented data packet (first byte has bit 7 set)
+    void handleFragmentedPacket(uint32_t seqNum, const uint8_t* payload, size_t len);
+
+    // Clean up incomplete fragment groups that have timed out
+    void cleanupStaleFragmentGroups();
+
+    // -------------------------------------------------------------------------
     // Background Thread
     // -------------------------------------------------------------------------
 
@@ -564,6 +582,17 @@ private:
     // SACK state for generating ACKs
     std::deque<uint32_t>        m_outOfOrderReceived;  // Out-of-order seq numbers received
     mutable std::mutex          m_sackMutex;
+
+    // Fragment reassembly
+    struct FragmentGroup {
+        MsgType                 msgType = MsgType::Data;
+        uint16_t                totalFragments = 0;
+        std::map<uint16_t, std::vector<uint8_t>> fragments;  // index -> chunk data
+        std::chrono::steady_clock::time_point startTime;
+    };
+    std::map<uint16_t, FragmentGroup> m_fragmentGroups;       // groupId -> group
+    mutable std::mutex          m_fragmentMutex;
+    uint16_t                    m_nextFragmentGroupId = 0;
 };
 
 } // namespace p2p

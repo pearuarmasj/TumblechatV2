@@ -590,7 +590,70 @@ VoidResult UdpTransport::send(MsgType type, const std::vector<uint8_t>& payload)
         return VoidResult::Err("Connection not established");
     }
 
-    return sendDataPacket(type, payload);
+    // Check if payload fits in a single packet (1 byte MsgType + payload data)
+    if (1 + payload.size() <= UDP_MAX_PAYLOAD_SIZE) {
+        // Small message: send as a single, non-fragmented DATA packet (existing path)
+        return sendDataPacket(type, payload);
+    }
+
+    // Large message: fragment it
+    // Each fragment payload format:
+    //   [0]      flags (0x80 = fragmented)
+    //   [1]      MsgType
+    //   [2..3]   fragment group ID (BE)
+    //   [4..5]   fragment index (BE)
+    //   [6..7]   total fragments (BE)
+    //   [8..N]   chunk data
+
+    uint16_t groupId = m_nextFragmentGroupId++;
+
+    // Calculate number of fragments
+    size_t totalBytes = payload.size();
+    size_t numFragments = (totalBytes + UDP_FRAGMENT_MAX_CHUNK - 1) / UDP_FRAGMENT_MAX_CHUNK;
+
+    if (numFragments > 65535) {
+        return VoidResult::Err("Payload too large to fragment (exceeds 65535 fragments)");
+    }
+
+    LOG_INFO("UdpTransport::send: Fragmenting message type=" +
+             std::string(MsgTypeName(type)) +
+             " size=" + std::to_string(totalBytes) +
+             " into " + std::to_string(numFragments) +
+             " fragments, groupId=" + std::to_string(groupId));
+
+    uint16_t totalFrags = static_cast<uint16_t>(numFragments);
+    size_t offset = 0;
+
+    for (uint16_t fragIndex = 0; fragIndex < totalFrags; ++fragIndex) {
+        size_t chunkSize = std::min(UDP_FRAGMENT_MAX_CHUNK, totalBytes - offset);
+
+        // Build fragment payload: [flags][msgType][groupId:2][fragIndex:2][totalFrags:2][chunk]
+        std::vector<uint8_t> fragPayload(UDP_FRAGMENT_HEADER_SIZE + chunkSize);
+        fragPayload[0] = 0x80;  // Fragmented flag
+        fragPayload[1] = static_cast<uint8_t>(type);
+        writeU16BE(fragPayload.data() + 2, groupId);
+        writeU16BE(fragPayload.data() + 4, fragIndex);
+        writeU16BE(fragPayload.data() + 6, totalFrags);
+        std::memcpy(fragPayload.data() + UDP_FRAGMENT_HEADER_SIZE,
+                     payload.data() + offset, chunkSize);
+
+        // Send as a raw DATA packet (the payload is pre-formatted, no MsgType prepend)
+        auto result = sendRawDataPacket(fragPayload);
+        if (!result) {
+            LOG_ERROR("UdpTransport::send: Failed to send fragment " +
+                      std::to_string(fragIndex) + "/" + std::to_string(totalFrags) +
+                      " of groupId=" + std::to_string(groupId) +
+                      ": " + result.error());
+            return result;
+        }
+
+        offset += chunkSize;
+    }
+
+    LOG_DEBUG("UdpTransport::send: All " + std::to_string(totalFrags) +
+              " fragments sent for groupId=" + std::to_string(groupId));
+
+    return VoidResult::Ok();
 }
 
 Result<std::pair<MsgType, std::vector<uint8_t>>, std::string> UdpTransport::receive() {
@@ -823,6 +886,84 @@ VoidResult UdpTransport::sendDataPacket(MsgType msgType, const std::vector<uint8
               std::string(MsgTypeName(msgType)) +
               " seq=" + std::to_string(seqNum) +
               " len=" + std::to_string(payload.size()));
+
+    return VoidResult::Ok();
+}
+
+VoidResult UdpTransport::sendRawDataPacket(const std::vector<uint8_t>& rawPayload) {
+    // Check congestion window
+    {
+        std::lock_guard<std::mutex> rtxLock(m_retransmitMutex);
+        std::lock_guard<std::mutex> congLock(m_congestionMutex);
+
+        if (!m_congestion.canSend(static_cast<uint32_t>(m_retransmitQueue.size()))) {
+            LOG_DEBUG("UdpTransport::sendRawDataPacket: Congestion window full, waiting...");
+            // For fragmented sends, we should wait rather than fail immediately
+            // to avoid partial fragment delivery
+        }
+    }
+
+    // Wait for congestion window to open (up to 10 seconds for large messages)
+    auto waitDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (true) {
+        {
+            std::lock_guard<std::mutex> rtxLock(m_retransmitMutex);
+            std::lock_guard<std::mutex> congLock(m_congestionMutex);
+            if (m_congestion.canSend(static_cast<uint32_t>(m_retransmitQueue.size()))) {
+                break;  // Window open, proceed
+            }
+        }
+        if (std::chrono::steady_clock::now() >= waitDeadline) {
+            return VoidResult::Err("Congestion window full, timeout waiting to send fragment");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // rawPayload is the complete DATA payload (already formatted with fragment header or MsgType)
+    // Get sequence number
+    uint32_t seqNum = m_nextSeqNum.fetch_add(1);
+
+    // Build header
+    UdpPacketHeader header;
+    header.type = UdpPacketType::DATA;
+    header.flags = 0;
+    header.payloadLen = static_cast<uint16_t>(rawPayload.size());
+    header.seqNum = seqNum;
+    header.ackNum = m_nextExpectedSeq > 0 ? m_nextExpectedSeq - 1 : 0;
+
+    // Build complete packet for retransmission queue
+    std::vector<uint8_t> packet(UDP_HEADER_SIZE + rawPayload.size());
+    header.serialize(packet.data());
+    std::memcpy(packet.data() + UDP_HEADER_SIZE, rawPayload.data(), rawPayload.size());
+
+    // Add to retransmit queue
+    auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(m_retransmitMutex);
+        std::lock_guard<std::mutex> congLock(m_congestionMutex);
+
+        RetransmitEntry entry;
+        entry.seqNum = seqNum;
+        entry.packet = packet;
+        entry.firstSent = now;
+        entry.lastSent = now;
+        entry.retryCount = 0;
+        entry.rtoMs = m_rttEstimator.getRto();
+
+        m_retransmitQueue[seqNum] = std::move(entry);
+    }
+
+    // Send packet
+    auto result = sendPacket(header, rawPayload.data(), rawPayload.size());
+    if (!result) {
+        // Remove from retransmit queue on send failure
+        std::lock_guard<std::mutex> lock(m_retransmitMutex);
+        m_retransmitQueue.erase(seqNum);
+        return result;
+    }
+
+    LOG_DEBUG("UdpTransport::sendRawDataPacket: Sent raw DATA seq=" + std::to_string(seqNum) +
+              " len=" + std::to_string(rawPayload.size()));
 
     return VoidResult::Ok();
 }
@@ -1319,6 +1460,70 @@ void UdpTransport::handleDataPacket(const UdpPacketHeader& header,
     }
 
     uint32_t seqNum = header.seqNum;
+
+    // Check if this is a fragmented packet (first byte has bit 7 set)
+    bool isFragmented = (payload[0] & 0x80) != 0;
+
+    if (isFragmented) {
+        // Fragmented packet - handle at the reliability layer first (seq/ack),
+        // then pass to fragment reassembly
+        LOG_DEBUG("UdpTransport::handleDataPacket: Fragmented packet seq=" + std::to_string(seqNum) +
+                  " expected=" + std::to_string(m_nextExpectedSeq));
+
+        if (seqNum == m_nextExpectedSeq) {
+            // In-order: process the fragment immediately
+            m_nextExpectedSeq++;
+            handleFragmentedPacket(seqNum, payload, len);
+
+            // Try to deliver non-fragment messages from reorder buffer
+            while (deliverFromReorderBuffer()) {}
+
+        } else if (seqNum > m_nextExpectedSeq) {
+            // Out of order: we need to buffer, but since fragments need special
+            // handling, we use a "virtual" MsgType and store the raw payload.
+            // When delivered from reorder buffer, we'll detect the fragment flag.
+            LOG_DEBUG("UdpTransport::handleDataPacket: Out-of-order fragment, buffering");
+
+            // Store raw fragment payload in reorder buffer with a sentinel MsgType
+            // We use the raw payload (including the 0x80 flag byte) so we can
+            // re-detect it when delivered from the reorder buffer
+            std::vector<uint8_t> rawData(payload, payload + len);
+            // Use a special approach: store with MsgType::Data as placeholder,
+            // but prefix the payload with the fragment flag so handleFragmentedPacket
+            // can process it when delivered.
+            // Actually, we store the ENTIRE raw payload (including flag byte) in the
+            // ReceivedMessage.payload, and set a sentinel msgType.
+            // When deliverFromReorderBuffer delivers it, we intercept it.
+
+            std::lock_guard<std::mutex> reorderLock(m_reorderMutex);
+            std::lock_guard<std::mutex> sackLock(m_sackMutex);
+
+            ReceivedMessage msg;
+            msg.seqNum = seqNum;
+            msg.msgType = static_cast<MsgType>(0xFF);  // Sentinel: raw fragment
+            msg.payload = std::move(rawData);
+            m_reorderBuffer[seqNum] = std::move(msg);
+
+            // Track for SACK
+            m_outOfOrderReceived.push_back(seqNum);
+
+            if (m_reorderBuffer.size() > 256) {
+                auto oldest = m_reorderBuffer.begin();
+                m_reorderBuffer.erase(oldest);
+                LOG_DEBUG("UdpTransport::handleDataPacket: Reorder buffer overflow, dropped oldest");
+            }
+
+        } else {
+            // Duplicate
+            LOG_DEBUG("UdpTransport::handleDataPacket: Duplicate fragment, ignoring");
+        }
+
+        // Always send ACK after receiving data
+        sendAck();
+        return;
+    }
+
+    // Non-fragmented packet (original path)
     MsgType msgType = static_cast<MsgType>(payload[0]);
     std::vector<uint8_t> data(payload + 1, payload + len);
 
@@ -1564,8 +1769,8 @@ void UdpTransport::insertIntoReorderBuffer(uint32_t seqNum,
     // Track for SACK
     m_outOfOrderReceived.push_back(seqNum);
 
-    // Limit reorder buffer size
-    if (m_reorderBuffer.size() > 64) {
+    // Limit reorder buffer size (256 to support large fragmented transfers)
+    if (m_reorderBuffer.size() > 256) {
         // Remove oldest entry
         auto oldest = m_reorderBuffer.begin();
         m_reorderBuffer.erase(oldest);
@@ -1587,7 +1792,33 @@ bool UdpTransport::deliverFromReorderBuffer() {
     LOG_DEBUG("UdpTransport::deliverFromReorderBuffer: Delivering seq=" +
               std::to_string(m_nextExpectedSeq));
 
-    // Deliver to application
+    // Check if this is a raw fragment (sentinel MsgType 0xFF)
+    bool isRawFragment = (static_cast<uint8_t>(it->second.msgType) == 0xFF);
+
+    if (isRawFragment) {
+        // This is a buffered fragment - process it through fragment reassembly
+        uint32_t seqNum = it->second.seqNum;
+        std::vector<uint8_t> rawPayload = std::move(it->second.payload);
+
+        // Remove from reorder buffer and SACK tracking
+        m_reorderBuffer.erase(it);
+
+        {
+            std::lock_guard<std::mutex> sackLock(m_sackMutex);
+            m_outOfOrderReceived.erase(
+                std::remove(m_outOfOrderReceived.begin(), m_outOfOrderReceived.end(), m_nextExpectedSeq),
+                m_outOfOrderReceived.end());
+        }
+
+        m_nextExpectedSeq++;
+
+        // Process the fragment (this may complete a group and deliver to app)
+        handleFragmentedPacket(seqNum, rawPayload.data(), rawPayload.size());
+
+        return true;
+    }
+
+    // Normal (non-fragment) message: deliver to application
     {
         std::lock_guard<std::mutex> lock(m_receiveMutex);
         m_receiveQueue.push(std::move(it->second));
@@ -1608,6 +1839,144 @@ bool UdpTransport::deliverFromReorderBuffer() {
     m_nextExpectedSeq++;
 
     return true;
+}
+
+// =============================================================================
+// Fragment Reassembly
+// =============================================================================
+
+void UdpTransport::handleFragmentedPacket(uint32_t seqNum, const uint8_t* payload, size_t len) {
+    // Fragment payload format:
+    //   [0]      flags (0x80 = fragmented)
+    //   [1]      MsgType
+    //   [2..3]   fragment group ID (BE)
+    //   [4..5]   fragment index (BE)
+    //   [6..7]   total fragments (BE)
+    //   [8..N]   chunk data
+
+    if (len < UDP_FRAGMENT_HEADER_SIZE) {
+        LOG_ERROR("UdpTransport::handleFragmentedPacket: Fragment too short (" +
+                  std::to_string(len) + " bytes)");
+        return;
+    }
+
+    MsgType msgType = static_cast<MsgType>(payload[1]);
+    uint16_t groupId = readU16BE(payload + 2);
+    uint16_t fragIndex = readU16BE(payload + 4);
+    uint16_t totalFrags = readU16BE(payload + 6);
+
+    if (totalFrags == 0) {
+        LOG_ERROR("UdpTransport::handleFragmentedPacket: Invalid totalFragments=0");
+        return;
+    }
+    if (fragIndex >= totalFrags) {
+        LOG_ERROR("UdpTransport::handleFragmentedPacket: fragIndex=" + std::to_string(fragIndex) +
+                  " >= totalFragments=" + std::to_string(totalFrags));
+        return;
+    }
+
+    // Extract chunk data
+    std::vector<uint8_t> chunkData(payload + UDP_FRAGMENT_HEADER_SIZE,
+                                    payload + len);
+
+    LOG_DEBUG("UdpTransport::handleFragmentedPacket: groupId=" + std::to_string(groupId) +
+              " frag=" + std::to_string(fragIndex) + "/" + std::to_string(totalFrags) +
+              " chunkLen=" + std::to_string(chunkData.size()) +
+              " msgType=" + std::string(MsgTypeName(msgType)));
+
+    std::lock_guard<std::mutex> lock(m_fragmentMutex);
+
+    // Get or create fragment group
+    auto& group = m_fragmentGroups[groupId];
+    if (group.totalFragments == 0) {
+        // New group
+        group.msgType = msgType;
+        group.totalFragments = totalFrags;
+        group.startTime = std::chrono::steady_clock::now();
+    } else {
+        // Existing group - validate consistency
+        if (group.totalFragments != totalFrags) {
+            LOG_ERROR("UdpTransport::handleFragmentedPacket: totalFragments mismatch for groupId=" +
+                      std::to_string(groupId) + " (expected " + std::to_string(group.totalFragments) +
+                      ", got " + std::to_string(totalFrags) + ")");
+            return;
+        }
+    }
+
+    // Store fragment (duplicates overwrite, which is fine)
+    group.fragments[fragIndex] = std::move(chunkData);
+
+    LOG_DEBUG("UdpTransport::handleFragmentedPacket: groupId=" + std::to_string(groupId) +
+              " received " + std::to_string(group.fragments.size()) + "/" +
+              std::to_string(group.totalFragments) + " fragments");
+
+    // Check if all fragments are received
+    if (group.fragments.size() == group.totalFragments) {
+        // Reassemble the full payload
+        std::vector<uint8_t> fullPayload;
+
+        // Pre-calculate total size
+        size_t totalSize = 0;
+        for (auto& [idx, chunk] : group.fragments) {
+            totalSize += chunk.size();
+        }
+        fullPayload.reserve(totalSize);
+
+        // Assemble in order
+        for (uint16_t i = 0; i < group.totalFragments; ++i) {
+            auto fragIt = group.fragments.find(i);
+            if (fragIt == group.fragments.end()) {
+                // Should not happen since we checked size == totalFragments
+                LOG_ERROR("UdpTransport::handleFragmentedPacket: Missing fragment " +
+                          std::to_string(i) + " in groupId=" + std::to_string(groupId));
+                m_fragmentGroups.erase(groupId);
+                return;
+            }
+            fullPayload.insert(fullPayload.end(),
+                               fragIt->second.begin(),
+                               fragIt->second.end());
+        }
+
+        MsgType reassembledType = group.msgType;
+
+        // Remove the completed group
+        m_fragmentGroups.erase(groupId);
+
+        LOG_INFO("UdpTransport::handleFragmentedPacket: Reassembled groupId=" +
+                 std::to_string(groupId) + " msgType=" + std::string(MsgTypeName(reassembledType)) +
+                 " totalSize=" + std::to_string(fullPayload.size()));
+
+        // Deliver the reassembled message to the application
+        {
+            std::lock_guard<std::mutex> recvLock(m_receiveMutex);
+            ReceivedMessage msg;
+            msg.seqNum = seqNum;  // Use seq of last fragment
+            msg.msgType = reassembledType;
+            msg.payload = std::move(fullPayload);
+            m_receiveQueue.push(std::move(msg));
+            m_receiveCondition.notify_one();
+        }
+    }
+}
+
+void UdpTransport::cleanupStaleFragmentGroups() {
+    auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(m_fragmentMutex);
+
+    for (auto it = m_fragmentGroups.begin(); it != m_fragmentGroups.end(); ) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - it->second.startTime).count();
+
+        if (elapsed >= UDP_FRAGMENT_TIMEOUT_MS) {
+            LOG_WARNING("UdpTransport::cleanupStaleFragmentGroups: Timeout for groupId=" +
+                        std::to_string(it->first) + " (received " +
+                        std::to_string(it->second.fragments.size()) + "/" +
+                        std::to_string(it->second.totalFragments) + " fragments)");
+            it = m_fragmentGroups.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 // =============================================================================
@@ -1639,6 +2008,11 @@ void UdpTransport::backgroundLoop() {
         if (m_state == UdpConnectionState::ESTABLISHED &&
             heartbeatElapsed >= UDP_HEARTBEAT_INTERVAL_MS) {
             sendHeartbeat();
+        }
+
+        // Clean up stale fragment groups
+        if (m_state == UdpConnectionState::ESTABLISHED) {
+            cleanupStaleFragmentGroups();
         }
 
         // Check heartbeat timeout
